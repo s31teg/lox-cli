@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Writing a `.Loxone` file no longer adds a carriage return to every line break inside attribute values. Loxone keeps bare LF in note text and CRLF in AutoPilot rule JSON; the CRLF post-process converted those too, and each save re-emitted the extra CR as `&#xD;`, so notes and AutoPilot rules grew one `&#xD;` per line break per save. Saving an unedited real-world config is now byte-identical.
+
 ## [0.14.2] — 2026-05-08
 
 ### Fixed
