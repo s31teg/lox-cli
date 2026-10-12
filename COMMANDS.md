@@ -53,6 +53,8 @@ lox config mode-list file.Loxone                  # list operating modes
 
 ## Config Editing
 
+Every editing command that changes the file also bumps the Document save stamp (`Date` / `DateS` on `<C Type="Document">`) to the current time. Loxone Config compares this stamp, not the content, to decide whether the opened file is the program already on the Miniserver — without the bump it would treat the edited file as identical and load the Miniserver's old program instead. Commands that end up changing nothing leave the stamp as is.
+
 ### Add blocks
 
 ```bash
