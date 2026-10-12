@@ -168,6 +168,12 @@ lox config scan file.Loxone --strict       # exit with error code if PII found (
 lox config report file.Loxone              # anonymised diagnostic report (scan + stats + check)
 ```
 
+`validate` also flags wiring that Loxone Config accepts but that silently misbehaves:
+
+- a Lighting Controller with motion/presence wired whose motion table has neither an "All other times" row nor a row for an operating mode most other motion-wired controllers list (motion does nothing while that mode is active), or no rows at all;
+- a pulse longer than 0.2 s (EdgeDetection `PulseTime`, Monoflop `Time`) into a mood input `Sel1..SelN` — it counts as a long-click and mixes the mood in instead of selecting it;
+- a wire taken from the `Q` of a reference to a device or virtual input (only `AQ` is used there; `Q` is valid on Memory flag references).
+
 ---
 
 ## Config Management
