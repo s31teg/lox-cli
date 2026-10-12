@@ -8,7 +8,9 @@ use std::time::Duration;
 use crate::client::{LOXONE_EPOCH_SECS, LoxClient, USER_AGENT};
 use crate::commands::RunContext;
 use crate::config::Config;
-use crate::config_edit::{ConfigEditor, VirtualInOpts};
+use crate::config_edit::{
+    ConfigEditor, PermissionChange, PermissionEdit, PrincipalKind, VirtualInOpts,
+};
 use crate::token;
 use crate::{
     CacheCmd, Cli, ConfigCmd, ControlCmd, MqttConfigCmd, RoomCmd, SetupCmd, TokenCmd, XmlEditCmd,
@@ -467,13 +469,32 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
             }
             let xml = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
             let users = loxone_xml::parse_users(&xml)?;
+            // Object permissions (PH/PRM) per user UUID. Best effort: a file the DOM
+            // editor cannot load still lists its users, just without permissions.
+            let perms: std::collections::HashMap<String, Vec<_>> = ConfigEditor::load(&xml)
+                .map(|ed| {
+                    ed.list_permissions(PrincipalKind::User)
+                        .into_iter()
+                        .map(|p| (p.uuid, p.permissions))
+                        .collect()
+                })
+                .unwrap_or_default();
             let total = users.len();
             let truncated = limit.is_some_and(|l| total > l);
             let display_limit = limit.unwrap_or(total);
             if ctx.json {
                 let shown = total.min(display_limit);
-                let items: Vec<_> = users.iter().take(display_limit).collect();
-                let mut obj = serde_json::to_value(&items)?;
+                let items = users
+                    .iter()
+                    .take(display_limit)
+                    .map(|u| {
+                        let mut v = serde_json::to_value(u)?;
+                        v["permissions"] =
+                            serde_json::to_value(perms.get(&u.uuid).cloned().unwrap_or_default())?;
+                        Ok(v)
+                    })
+                    .collect::<Result<Vec<serde_json::Value>>>()?;
+                let mut obj = serde_json::Value::Array(items);
                 if truncated {
                     let wrapper = serde_json::json!({
                         "users": obj,
@@ -486,12 +507,13 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
                 let nfc_count = users.iter().filter(|u| u.nfc).count();
-                println!("  {:<26} {:<6} Description", "Name", "NFC");
+                println!("  {:<26} {:<6} {:<6} Description", "Name", "NFC", "Perms");
                 for u in users.iter().take(display_limit) {
                     println!(
-                        "  {:<26} {:<6} {}",
+                        "  {:<26} {:<6} {:<6} {}",
                         u.name,
                         if u.nfc { "yes" } else { "-" },
+                        perms.get(&u.uuid).map(|p| p.len()).unwrap_or(0),
                         u.description,
                     );
                 }
@@ -1365,11 +1387,20 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
             min,
             max,
             unit,
+            grant,
             save_as,
         } => {
+            let is_virtual_input =
+                matches!(control_type.as_str(), "virtual-input" | "virtual-in" | "vi");
+            if grant.is_some() && !is_virtual_input {
+                bail!(
+                    "--grant is only supported with --type virtual-input. For other objects run `lox config user-grant {} <user> <object>` after adding.",
+                    file
+                );
+            }
             // Virtual inputs have a dedicated builder (InputRef converter, IName,
             // IoData Pr/Cr, non-clamping analog defaults).
-            if matches!(control_type.as_str(), "virtual-input" | "virtual-in" | "vi") {
+            if is_virtual_input {
                 let data = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
                 let mut editor = ConfigEditor::load(&data)?;
                 let parent_sel = parent
@@ -1382,20 +1413,39 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
                     max,
                     unit: unit.clone(),
                 };
-                let uuid = editor.add_virtual_in(&title, &opts, parent_sel)?;
+                let (vi_uuid, uuid) = editor.add_virtual_in(&title, &opts, parent_sel)?;
+                let granted = match grant.as_deref() {
+                    Some(user) => Some(editor.grant_permission(
+                        user,
+                        PrincipalKind::User,
+                        &format!("uuid:{}", vi_uuid),
+                        None,
+                    )?),
+                    None => None,
+                };
                 if ctx.json {
-                    emit_json(
-                        ctx,
-                        serde_json::json!({
-                            "ok": true,
-                            "type": "VirtualIn",
-                            "uuid": uuid,
-                            "title": title,
-                            "analog": analog,
-                        }),
-                    );
+                    let mut obj = serde_json::json!({
+                        "ok": true,
+                        "type": "VirtualIn",
+                        "uuid": uuid,
+                        "title": title,
+                        "analog": analog,
+                    });
+                    if let Some(ref g) = granted {
+                        obj["virtual_in_uuid"] = serde_json::Value::String(vi_uuid.clone());
+                        obj["granted"] = serde_json::to_value(&g.principal)?;
+                    }
+                    emit_json(ctx, obj);
                 } else if !ctx.quiet {
                     println!("✓ Created VirtualIn \"{}\" (UUID: {})", title, uuid);
+                    if let Some(ref g) = granted {
+                        println!(
+                            "✓ Granted user '{}' access to VirtualIn uuid:{} [ACT={}]",
+                            g.principal.title,
+                            vi_uuid,
+                            g.act.as_deref().unwrap_or("-")
+                        );
+                    }
                     println!(
                         "  Push via: /jdev/sps/io/{}/<value>  (wire blocks from its InputRef.AQ)",
                         uuid
@@ -2008,6 +2058,67 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
             println!("✓ Removed user '{}' (UUID: {})", name, uuid);
             save_edited(&editor, &file, save_as.as_deref())?;
         }
+        ConfigCmd::UserGrant {
+            file,
+            user,
+            object,
+            group,
+            act,
+            save_as,
+        } => {
+            let data = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
+            let mut editor = ConfigEditor::load(&data)?;
+            let kind = principal_kind(group);
+            let act = act.map(|a| a.to_string());
+            let edit = editor.grant_permission(&user, kind, &object, act.as_deref())?;
+            report_permission_edit(ctx, "grant", &edit);
+            if edit.changed() || save_as.is_some() {
+                save_edited(&editor, &file, save_as.as_deref())?;
+            }
+        }
+        ConfigCmd::UserRevoke {
+            file,
+            user,
+            object,
+            group,
+            save_as,
+        } => {
+            let data = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
+            let mut editor = ConfigEditor::load(&data)?;
+            let edit = editor.revoke_permission(&user, principal_kind(group), &object)?;
+            report_permission_edit(ctx, "revoke", &edit);
+            if edit.changed() || save_as.is_some() {
+                save_edited(&editor, &file, save_as.as_deref())?;
+            }
+        }
+        ConfigCmd::UserPerms { file, user, group } => {
+            let data = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
+            let editor = ConfigEditor::load(&data)?;
+            let perms = editor.principal_permissions(&user, principal_kind(group))?;
+            if ctx.json {
+                emit_json(ctx, serde_json::to_value(&perms)?);
+            } else {
+                if !ctx.no_header {
+                    println!("  {:<32} {:<22} {:<4} UUID", "TITLE", "TYPE", "ACT");
+                    println!("  {}", "─".repeat(96));
+                }
+                for p in &perms.permissions {
+                    println!(
+                        "  {:<32} {:<22} {:<4} {}",
+                        p.title.as_deref().unwrap_or("-"),
+                        p.element_type.as_deref().unwrap_or("-"),
+                        p.act.as_deref().unwrap_or("-"),
+                        p.uuid
+                    );
+                }
+                println!(
+                    "\n{} permission(s) for {} '{}'",
+                    perms.permissions.len(),
+                    perms.kind.noun().to_lowercase(),
+                    perms.title
+                );
+            }
+        }
         ConfigCmd::DeviceBind {
             file,
             control,
@@ -2133,6 +2244,7 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
             max,
             unit,
             parent,
+            grant,
             save_as,
         } => {
             let data = fs::read(&file).with_context(|| format!("Cannot read {}", file))?;
@@ -2145,20 +2257,39 @@ pub fn cmd_config(ctx: &RunContext, action: ConfigCmd) -> Result<()> {
                 max,
                 unit,
             };
-            let aq_uuid = editor.add_virtual_in(&title, &opts, parent_sel)?;
+            let (vi_uuid, aq_uuid) = editor.add_virtual_in(&title, &opts, parent_sel)?;
+            let granted = match grant.as_deref() {
+                Some(user) => Some(editor.grant_permission(
+                    user,
+                    PrincipalKind::User,
+                    &format!("uuid:{}", vi_uuid),
+                    None,
+                )?),
+                None => None,
+            };
             if ctx.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "uuid": aq_uuid,
-                        "connector_key": "AQ",
-                        "connector_uuid": aq_uuid,
-                        "title": title,
-                    })
-                );
+                let mut obj = serde_json::json!({
+                    "uuid": aq_uuid,
+                    "connector_key": "AQ",
+                    "connector_uuid": aq_uuid,
+                    "title": title,
+                });
+                if let Some(ref g) = granted {
+                    obj["virtual_in_uuid"] = serde_json::Value::String(vi_uuid.clone());
+                    obj["granted"] = serde_json::to_value(&g.principal)?;
+                }
+                println!("{}", obj);
             } else {
                 println!("✓ Created VirtualIn \"{}\" (UUID: {})", title, aq_uuid);
                 println!("  AQ connector: {}", aq_uuid);
+                if let Some(ref g) = granted {
+                    println!(
+                        "✓ Granted user '{}' access to VirtualIn uuid:{} [ACT={}]",
+                        g.principal.title,
+                        vi_uuid,
+                        g.act.as_deref().unwrap_or("-")
+                    );
+                }
             }
             save_edited(&editor, &file, save_as.as_deref())?;
         }
@@ -3301,6 +3432,64 @@ fn collect_block_connectors(editor: &ConfigEditor, uuid: &str) -> Vec<serde_json
             .collect()
     } else {
         vec![]
+    }
+}
+
+fn principal_kind(group: bool) -> PrincipalKind {
+    if group {
+        PrincipalKind::UserGroup
+    } else {
+        PrincipalKind::User
+    }
+}
+
+/// Print the outcome of `user-grant` / `user-revoke` (JSON, or a ✓ line unless --quiet).
+fn report_permission_edit(ctx: &RunContext, action: &str, edit: &PermissionEdit) {
+    if ctx.json {
+        let mut obj = serde_json::to_value(edit).unwrap_or_default();
+        obj["ok"] = serde_json::Value::Bool(true);
+        obj["action"] = serde_json::Value::String(action.to_string());
+        obj["changed"] = serde_json::Value::Bool(edit.changed());
+        emit_json(ctx, obj);
+        return;
+    }
+    if ctx.quiet {
+        return;
+    }
+    let who = format!(
+        "{} '{}'",
+        edit.principal.kind.noun().to_lowercase(),
+        edit.principal.title
+    );
+    let who_cap = format!("{} '{}'", edit.principal.kind.noun(), edit.principal.title);
+    let what = edit.object.describe();
+    let act = |a: &Option<String>| a.clone().unwrap_or_else(|| "-".to_string());
+    match edit.change {
+        PermissionChange::Added => {
+            println!(
+                "✓ Granted {} access to {} [ACT={}]",
+                who,
+                what,
+                act(&edit.act)
+            )
+        }
+        PermissionChange::Updated => println!(
+            "✓ Updated {} access to {} [ACT {} → {}]",
+            who,
+            what,
+            act(&edit.previous_act),
+            act(&edit.act)
+        ),
+        PermissionChange::Unchanged => println!(
+            "✓ {} already has access to {} [ACT={}] — no change",
+            who_cap,
+            what,
+            act(&edit.act)
+        ),
+        PermissionChange::Removed => println!("✓ Revoked {} access to {}", who, what),
+        PermissionChange::Absent => {
+            println!("✓ {} has no permission on {} — no change", who_cap, what)
+        }
     }
 }
 
@@ -4864,6 +5053,7 @@ mod tests {
                 min: None,
                 max: None,
                 unit: None,
+                grant: None,
                 save_as: None,
             },
         );
@@ -4892,6 +5082,7 @@ mod tests {
                 min: None,
                 max: None,
                 unit: None,
+                grant: None,
                 save_as: Some(out.to_str().unwrap().to_string()),
             },
         );
@@ -5259,6 +5450,7 @@ sleep</Field>
                 max: None,
                 unit: None,
                 parent: Some("Type:Page".to_string()),
+                grant: None,
                 save_as: None,
             },
         );
@@ -5311,6 +5503,93 @@ sleep</Field>
         assert!(result.is_ok());
         let data = fs::read_to_string(&file).unwrap();
         assert!(!data.contains("testuser"));
+    }
+
+    #[test]
+    fn test_cmd_user_grant_perms_revoke() {
+        let (_dir, file) = fixture_file();
+        cmd_config(
+            &ctx(),
+            ConfigCmd::UserAdd {
+                file: file.clone(),
+                name: "api".to_string(),
+                save_as: None,
+            },
+        )
+        .unwrap();
+        let before = fs::read(&file).unwrap();
+
+        let grant = || {
+            cmd_config(
+                &ctx(),
+                ConfigCmd::UserGrant {
+                    file: file.clone(),
+                    user: "api".to_string(),
+                    object: "TestAnd".to_string(),
+                    group: false,
+                    act: None,
+                    save_as: None,
+                },
+            )
+        };
+        grant().unwrap();
+        let data = fs::read_to_string(&file).unwrap();
+        assert!(data.contains(r#"<PRM REF="a-0001-0001-0001-ffff000000000001" ACT="3"/>"#));
+        assert_eq!(data.matches("<PRM ").count(), 1);
+
+        // Idempotent: second grant does not touch the file
+        let after_first = fs::read(&file).unwrap();
+        grant().unwrap();
+        assert_eq!(fs::read(&file).unwrap(), after_first);
+
+        let perms = cmd_config(
+            &ctx(),
+            ConfigCmd::UserPerms {
+                file: file.clone(),
+                user: "api".to_string(),
+                group: false,
+            },
+        );
+        assert!(perms.is_ok());
+
+        cmd_config(
+            &ctx(),
+            ConfigCmd::UserRevoke {
+                file: file.clone(),
+                user: "api".to_string(),
+                object: "TestAnd".to_string(),
+                group: false,
+                save_as: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(&file).unwrap(), before);
+    }
+
+    #[test]
+    fn test_cmd_add_grant_rejected_for_non_virtual_input() {
+        let (_dir, file) = fixture_file();
+        let result = cmd_config(
+            &ctx(),
+            ConfigCmd::Add {
+                file: file.clone(),
+                control_type: "And".to_string(),
+                title: "X".to_string(),
+                room: None,
+                category: None,
+                parent: None,
+                page: None,
+                device: None,
+                topic: None,
+                analog: false,
+                min: None,
+                max: None,
+                unit: None,
+                grant: Some("api".to_string()),
+                save_as: None,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

@@ -485,3 +485,212 @@ fn config_add_idempotent_different_type_creates_new() {
     let content = fs::read_to_string(&out).unwrap();
     assert!(content.contains("TestAnd"), "New block should be created");
 }
+
+// ── config user-grant / user-revoke / user-perms ────────────────────────────
+
+/// Loxone-formatted fixture (BOM, CRLF, tab indentation) with a user, a group and
+/// two virtual inputs. It round-trips byte-identically through the editor.
+fn write_user_fixture(dir: &TempDir) -> (String, Vec<u8>) {
+    let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<ControlList Version=\"267\">\n\
+\t<C Type=\"Document\" V=\"178\" U=\"doc-1\" Title=\"Test\">\n\
+\t\t<C Type=\"VirtualInCaption\" V=\"178\" U=\"vic-1\" Title=\"Virtual Inputs\">\n\
+\t\t\t<C Type=\"VirtualIn\" V=\"178\" U=\"vi-1-ffff504f94a010d0\" Title=\"UniFi Doorbell\" WF=\"16384\"/>\n\
+\t\t\t<C Type=\"VirtualIn\" V=\"178\" U=\"vi-2-ffff504f94a010d0\" Title=\"UniFi Gate\" WF=\"16384\"/>\n\
+\t\t</C>\n\
+\t\t<C Type=\"UserCaption\" V=\"178\" U=\"uc-1\" Title=\"Users\">\n\
+\t\t\t<C Type=\"User\" V=\"178\" U=\"user-1\" Title=\"webhook_api\" WF=\"16384\">\n\
+\t\t\t\t<HP H=\"h\" Sc=\"2\" S=\"s\" Alg=\"1\"/>\n\
+\t\t\t\t<PH NUM=\"1\">\n\
+\t\t\t\t\t<PRM REF=\"vi-2-ffff504f94a010d0\" ACT=\"3\"/>\n\
+\t\t\t\t</PH>\n\
+\t\t\t</C>\n\
+\t\t\t<C Type=\"UserGroup\" V=\"178\" U=\"grp-1\" Title=\"Webhooks\" WF=\"16384\" User=\"\"/>\n\
+\t\t</C>\n\
+\t</C>\n\
+</ControlList>\n";
+    let mut data = vec![0xEF, 0xBB, 0xBF];
+    data.extend_from_slice(xml.replace('\n', "\r\n").as_bytes());
+    let path = dir.path().join("users.Loxone");
+    fs::write(&path, &data).unwrap();
+    (path.to_str().unwrap().to_string(), data)
+}
+
+#[test]
+fn config_user_grant_then_revoke_is_byte_identical() {
+    let dir = TempDir::new().unwrap();
+    let (path, original) = write_user_fixture(&dir);
+
+    lox()
+        .args([
+            "config",
+            "user-grant",
+            &path,
+            "webhook_api",
+            "UniFi Doorbell",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Granted user 'webhook_api' access to VirtualIn 'UniFi Doorbell'",
+        ));
+    let granted = fs::read_to_string(&path).unwrap();
+    assert!(granted.contains(
+        "<PH NUM=\"2\">\r\n\t\t\t\t\t<PRM REF=\"vi-2-ffff504f94a010d0\" ACT=\"3\"/>\r\n\t\t\t\t\t<PRM REF=\"vi-1-ffff504f94a010d0\" ACT=\"3\"/>\r\n"
+    ));
+
+    lox()
+        .args([
+            "config",
+            "user-revoke",
+            &path,
+            "webhook_api",
+            "UniFi Doorbell",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Revoked user 'webhook_api'"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn config_user_grant_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let (path, original) = write_user_fixture(&dir);
+
+    let output = lox()
+        .args([
+            "-o",
+            "json",
+            "config",
+            "user-grant",
+            &path,
+            "webhook_api",
+            "uuid:vi-2-ffff504f94a010d0",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["changed"], false);
+    assert_eq!(json["change"], "unchanged");
+    assert_eq!(json["object"]["title"], "UniFi Gate");
+    assert_eq!(fs::read(&path).unwrap(), original);
+
+    lox()
+        .args([
+            "config",
+            "user-revoke",
+            &path,
+            "webhook_api",
+            "UniFi Doorbell",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no change"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn config_user_grant_group_and_ambiguous_object() {
+    let dir = TempDir::new().unwrap();
+    let (path, original) = write_user_fixture(&dir);
+
+    // "UniFi" matches several elements → must be rejected, file untouched
+    lox()
+        .args(["config", "user-grant", &path, "webhook_api", "UniFi"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expected 1"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+
+    lox()
+        .args([
+            "config",
+            "user-grant",
+            &path,
+            "Webhooks",
+            "UniFi Gate",
+            "--group",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("user group 'Webhooks'"));
+    lox()
+        .args([
+            "config",
+            "user-revoke",
+            &path,
+            "Webhooks",
+            "UniFi Gate",
+            "--group",
+        ])
+        .assert()
+        .success();
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn config_user_perms_and_users_list_permissions() {
+    let dir = TempDir::new().unwrap();
+    let (path, _) = write_user_fixture(&dir);
+
+    lox()
+        .args(["config", "user-perms", &path, "webhook_api"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("UniFi Gate"))
+        .stdout(predicate::str::contains("VirtualIn"))
+        .stdout(predicate::str::contains("1 permission(s)"));
+
+    let output = lox()
+        .args(["-o", "json", "config", "users", &path])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let perms = &json[0]["permissions"];
+    assert_eq!(perms[0]["uuid"], "vi-2-ffff504f94a010d0");
+    assert_eq!(perms[0]["title"], "UniFi Gate");
+    assert_eq!(perms[0]["type"], "VirtualIn");
+}
+
+#[test]
+fn config_add_virtual_input_with_grant() {
+    let dir = TempDir::new().unwrap();
+    let (path, _) = write_user_fixture(&dir);
+
+    let output = lox()
+        .args([
+            "-o",
+            "json",
+            "config",
+            "add",
+            &path,
+            "--type",
+            "virtual-input",
+            "--title",
+            "UniFi Webhook",
+            "--grant",
+            "webhook_api",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let uuid = json["virtual_in_uuid"].as_str().unwrap().to_string();
+    assert_eq!(json["granted"]["title"], "webhook_api");
+
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("<PH NUM=\"2\">"));
+    assert!(content.contains(&format!("<PRM REF=\"{uuid}\" ACT=\"3\"/>")));
+    assert!(content.contains(&format!(
+        "Type=\"VirtualIn\" IName=\"VI0\" V=\"175\" U=\"{uuid}\""
+    )));
+}

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `lox config user-grant` / `user-revoke` edit a user's (or, with `--group`, a user group's) object permissions (`<PH>`/`<PRM>`) in a `.Loxone` file — e.g. to let an API user call `/dev/sps/io/<input>/...` without HTTP 403. Idempotent; only the `<PH>` block changes.
+- `lox config user-perms` lists the objects a user may access; `lox config users` shows a permission count and, with `-o json`, each user's `uuid` and resolved `permissions`.
+- `--grant <USER>` on `lox config add --type virtual-input` and `lox config add-virtual-in`.
+
 ## [0.14.2] — 2026-05-08
 
 ### Fixed

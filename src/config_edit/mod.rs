@@ -15,6 +15,7 @@
 mod blocks;
 mod describe;
 mod layout;
+mod permissions;
 mod properties;
 mod rooms;
 mod selector;
@@ -24,6 +25,7 @@ mod wiring;
 mod write;
 
 pub use blocks::VirtualInOpts;
+pub use permissions::{PermissionChange, PermissionEdit, PrincipalKind};
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -1502,10 +1504,11 @@ mod tests {
     #[test]
     fn test_add_virtual_in_places_inputref_on_page() {
         let mut editor = ConfigEditor::load(SAMPLE_WITH_PAGE).unwrap();
-        let aq_uuid = editor
+        let (vi_uuid, aq_uuid) = editor
             .add_virtual_in("TestVI", &VirtualInOpts::default(), "Type:VirtualInCaption")
             .unwrap();
         assert!(!aq_uuid.is_empty());
+        assert_ne!(vi_uuid, aq_uuid);
 
         // InputRef should NOT be inside VirtualIn (breaks SPS I/O registration)
         let vi_refs = editor.find_elements("Type:VirtualIn");

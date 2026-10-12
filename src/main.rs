@@ -215,7 +215,7 @@ pub(crate) enum Cmd {
     /// Download, inspect, and manage Loxone Config files
     Config {
         #[command(subcommand)]
-        action: ConfigCmd,
+        action: Box<ConfigCmd>,
     },
     /// Manage multiple Miniserver contexts
     Ctx {
@@ -616,6 +616,10 @@ pub(crate) enum ConfigCmd {
         /// Display unit format (virtual-input only, e.g. "<v>")
         #[arg(long)]
         unit: Option<String>,
+        /// Also grant this user permission on the new input (virtual-input only),
+        /// same as a follow-up `lox config user-grant`
+        #[arg(long, value_name = "USER")]
+        grant: Option<String>,
         #[arg(long)]
         save_as: Option<String>,
     },
@@ -665,6 +669,50 @@ pub(crate) enum ConfigCmd {
         name: String,
         #[arg(long)]
         save_as: Option<String>,
+    },
+    /// Grant a user (or user group) permission on an object, e.g. a virtual input.
+    /// Without it the Miniserver answers /dev/sps/io/<object>/... with HTTP 403.
+    /// Idempotent: an existing permission is left unchanged.
+    UserGrant {
+        /// Path to a .Loxone XML file
+        file: String,
+        /// User title (exact, case-insensitive) or uuid:<uuid>
+        user: String,
+        /// Object selector: title (fuzzy), "Title [Room]", uuid:<uuid>, Type:<type>; must match one element
+        object: String,
+        /// Treat <USER> as a user group instead of a user
+        #[arg(long)]
+        group: bool,
+        /// Raw ACT access value (default 3 = control access, as written by Loxone Config)
+        #[arg(long, value_name = "N")]
+        act: Option<u32>,
+        #[arg(long)]
+        save_as: Option<String>,
+    },
+    /// Revoke a user's (or user group's) permission on an object.
+    /// Idempotent: revoking a permission that is not present changes nothing.
+    UserRevoke {
+        /// Path to a .Loxone XML file
+        file: String,
+        /// User title (exact, case-insensitive) or uuid:<uuid>
+        user: String,
+        /// Object selector: title (fuzzy), "Title [Room]", uuid:<uuid>, Type:<type>; must match one element
+        object: String,
+        /// Treat <USER> as a user group instead of a user
+        #[arg(long)]
+        group: bool,
+        #[arg(long)]
+        save_as: Option<String>,
+    },
+    /// List the objects a user (or user group) has permission on
+    UserPerms {
+        /// Path to a .Loxone XML file
+        file: String,
+        /// User title (exact, case-insensitive) or uuid:<uuid>
+        user: String,
+        /// Treat <USER> as a user group instead of a user
+        #[arg(long)]
+        group: bool,
     },
     /// Wire a physical device/sensor to a logical control
     #[command(visible_alias = "bind")]
@@ -741,6 +789,10 @@ pub(crate) enum ConfigCmd {
         /// Parent element selector (default: VirtualInCaption)
         #[arg(long)]
         parent: Option<String>,
+        /// Also grant this user permission on the new input,
+        /// same as a follow-up `lox config user-grant`
+        #[arg(long, value_name = "USER")]
+        grant: Option<String>,
         #[arg(long)]
         save_as: Option<String>,
     },
@@ -1258,7 +1310,7 @@ fn run(cli: Cli) -> Result<()> {
             TelemetryCmd::Disable => telemetry::cmd_telemetry_disable(),
             TelemetryCmd::Status => telemetry::cmd_telemetry_status(),
         },
-        Cmd::Config { action } => commands::config_cmd::cmd_config(&ctx, action),
+        Cmd::Config { action } => commands::config_cmd::cmd_config(&ctx, *action),
         Cmd::Ctx { action } => commands::ctx::cmd_ctx(&ctx, action),
         Cmd::Completions { shell, install } => {
             commands::config_cmd::cmd_completions(&ctx, shell, install)
